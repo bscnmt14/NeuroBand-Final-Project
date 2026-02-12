@@ -1,0 +1,983 @@
+import sys
+import time
+import threading
+import math
+import os
+import csv
+import json
+import re
+from datetime import datetime
+
+import numpy as np
+import serial
+from serial.tools import list_ports
+
+import umyo_parser  # Must be in the same folder
+
+# --- GUI and Plotting Libraries ---
+from PySide6 import QtWidgets, QtCore, QtGui
+import pyqtgraph as pg
+
+# --- Signal Processing Library ---
+from scipy import signal
+
+
+# ---------- Serial Reader Thread (High Frequency) ----------
+
+class SerialReader(threading.Thread):
+    def __init__(self, callback=None, baudrate=921600):
+        super().__init__(daemon=True)
+        self.baudrate = baudrate
+        self.running = True
+        self.ser = None
+        self.callback = callback  # Function to call when data arrives
+
+    def find_port(self):
+        """Auto-detects the uMyo dongle port."""
+        ports = list(list_ports.comports())
+        for p in ports:
+            desc = p.description.lower()
+            if "usb" in desc or "serial" in desc or "uart" in desc:
+                return p.device
+            if "usbserial" in p.device:
+                return p.device
+
+        if len(ports) > 0:
+            return ports[0].device
+        return None
+
+    def open_serial(self):
+        port = self.find_port()
+        if port is None:
+            print("No uMyo serial port found!")
+            return False
+
+        try:
+            # Open with timeout=0 for non-blocking read
+            self.ser = serial.Serial(port, baudrate=self.baudrate, timeout=0)
+            print(f"Opened serial on {port}")
+            return True
+        except serial.SerialException as e:
+            print(f"Error opening serial port {port}: {e}")
+            return False
+
+    def run(self):
+        if not self.open_serial():
+            return
+
+        while self.running:
+            try:
+                if self.ser.in_waiting > 0:
+                    data = self.ser.read(self.ser.in_waiting)
+                    umyo_parser.umyo_parse_preprocessor(data)
+
+                    # Trigger logging immediately
+                    if self.callback:
+                        self.callback()
+
+                time.sleep(0.001)  # minimal sleep
+            except Exception as e:
+                print("Serial error:", e)
+                break
+
+        if self.ser is not None:
+            self.ser.close()
+            print("Serial closed")
+
+    def stop(self):
+        self.running = False
+
+
+# ---------- Filter Settings Panel ----------
+
+class FilterPanel(QtWidgets.QGroupBox):
+    filter_changed = QtCore.Signal()
+
+    def __init__(self, parent=None):
+        super().__init__("Real-time Filter Settings", parent)
+        self.FS = 1200.0  # EMG Sampling Rate in Hz
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Filter Type
+        layout.addWidget(QtWidgets.QLabel("Filter Type:"))
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItem("None", userData="none")
+        self.type_combo.addItem("High-Pass (HPF)", userData="hp")
+        self.type_combo.addItem("Low-Pass (LPF)", userData="lp")
+        self.type_combo.addItem("Band-Stop (BSF)", userData="bs")
+        self.type_combo.setCurrentText("None")
+        self.type_combo.currentTextChanged.connect(self._on_settings_changed)
+        layout.addWidget(self.type_combo)
+
+        # Filter Order
+        layout.addWidget(QtWidgets.QLabel("Order (N):"))
+        self.order_spin = QtWidgets.QSpinBox()
+        self.order_spin.setRange(1, 10)
+        self.order_spin.setValue(4)
+        self.order_spin.valueChanged.connect(self._on_settings_changed)
+        layout.addWidget(self.order_spin)
+
+        # Cutoff/Center Frequency
+        layout.addWidget(QtWidgets.QLabel("Cutoff Freq (Hz):"))
+        self.center_cutoff_spin = QtWidgets.QDoubleSpinBox()
+        self.center_cutoff_spin.setRange(0.1, self.FS / 2.0 - 1)
+        self.center_cutoff_spin.setSingleStep(1.0)
+        self.center_cutoff_spin.setValue(50.0)
+        self.center_cutoff_spin.valueChanged.connect(self._on_settings_changed)
+        layout.addWidget(self.center_cutoff_spin)
+
+        # Band-Stop Deltas
+        self.bs_label = QtWidgets.QLabel(r"Band-Stop Deltas (Left, Right in Hz):")
+        layout.addWidget(self.bs_label)
+
+        self.bs_container = QtWidgets.QWidget()
+        band_layout = QtWidgets.QHBoxLayout(self.bs_container)
+
+        self.bs_left_delta_spin = QtWidgets.QDoubleSpinBox()
+        self.bs_left_delta_spin.setRange(0.1, self.FS / 2.0 - 1)
+        self.bs_left_delta_spin.setSingleStep(0.5)
+        self.bs_left_delta_spin.setValue(5.0)
+        self.bs_left_delta_spin.valueChanged.connect(self._on_settings_changed)
+        band_layout.addWidget(self.bs_left_delta_spin)
+
+        self.bs_right_delta_spin = QtWidgets.QDoubleSpinBox()
+        self.bs_right_delta_spin.setRange(0.1, self.FS / 2.0 - 1)
+        self.bs_right_delta_spin.setSingleStep(0.5)
+        self.bs_right_delta_spin.setValue(5.0)
+        self.bs_right_delta_spin.valueChanged.connect(self._on_settings_changed)
+        band_layout.addWidget(self.bs_right_delta_spin)
+
+        layout.addWidget(self.bs_container)
+        self._update_bs_visibility(self.type_combo.currentData() == "bs")
+        layout.addStretch()
+
+    def _update_bs_visibility(self, is_bs: bool):
+        if hasattr(self, 'bs_label'): self.bs_label.setVisible(is_bs)
+        if hasattr(self, 'bs_container'): self.bs_container.setVisible(is_bs)
+
+        label_text = "Center Freq (Hz):" if is_bs else "Cutoff Freq (Hz):"
+        try:
+            layout_obj = self.center_cutoff_spin.parent().layout()
+            label = layout_obj.itemAt(layout_obj.indexOf(self.center_cutoff_spin) - 1).widget()
+            if isinstance(label, QtWidgets.QLabel): label.setText(label_text)
+        except:
+            pass
+
+    def _on_settings_changed(self):
+        self._update_bs_visibility(self.type_combo.currentData() == "bs")
+        self.filter_changed.emit()
+
+    def get_filter_params(self):
+        f_type = self.type_combo.currentData()
+        order = self.order_spin.value()
+        MIN_BANDWIDTH_HZ = 0.5
+
+        if f_type in ["hp", "lp"]:
+            cutoff = self.center_cutoff_spin.value()
+            if cutoff <= 0.1 or cutoff >= self.FS / 2.0 - 0.1: return "none", 0, 0.0
+            return f_type, order, cutoff
+        elif f_type == "bs":
+            center_freq = self.center_cutoff_spin.value()
+            low = max(0.1, center_freq - self.bs_left_delta_spin.value())
+            high = min(self.FS / 2.0 - 0.1, center_freq + self.bs_right_delta_spin.value())
+            if low >= high or (high - low) < MIN_BANDWIDTH_HZ: return "none", 0, 0.0
+            return f_type, order, [low, high]
+        return "none", 0, 0.0
+
+
+# ---------- Device Display Panel ----------
+
+class DevicePanel(QtWidgets.QWidget):
+    filter_panel: FilterPanel = None
+
+    def __init__(self, index: int, emg_len=2000, acc_len=200, parent=None):
+        super().__init__(parent)
+        self.index = index
+        self.emg_len = emg_len
+        self.acc_len = acc_len
+
+        # Buffers
+        self.emg_buffer = np.zeros(self.emg_len, dtype=float)
+        self.acc_x = np.zeros(self.acc_len, dtype=float)
+        self.acc_y = np.zeros(self.acc_len, dtype=float)
+        self.acc_z = np.zeros(self.acc_len, dtype=float)
+
+        # Filter State
+        self.FS = 1100.0
+        self.b, self.a = None, None
+        self.zi = None
+        self.filtered_emg_buffer = np.zeros(self.emg_len, dtype=float)
+
+        # Colors: Blue, Orange, Green, Red
+        self.bar_colors = ['#0000FF', '#FFA500', '#00FF00', '#FF0000']
+
+        if DevicePanel.filter_panel is not None:
+            DevicePanel.filter_panel.filter_changed.connect(self._init_filter)
+            self._init_filter()
+
+        self._build_ui()
+
+    def _init_filter(self):
+        if DevicePanel.filter_panel is None:
+            self.b, self.a, self.zi = None, None, None
+            return
+
+        f_type, order, w_freq = DevicePanel.filter_panel.get_filter_params()
+
+        if f_type == "none":
+            self.b, self.a, self.zi = None, None, None
+            return
+
+        if f_type in ["hp", "lp"]:
+            Wn = w_freq / (self.FS / 2.0)
+        elif f_type == "bs":
+            Wn = np.array(w_freq) / (self.FS / 2.0)
+        else:
+            self.b, self.a, self.zi = None, None, None
+            return
+
+        try:
+            self.b, self.a = signal.butter(order, Wn, f_type, analog=False)
+            if len(self.a) > 1:
+                self.zi = np.zeros(len(self.a) - 1, dtype=float)
+            else:
+                self.zi = None
+        except Exception as e:
+            print(f"Device {self.index}: Filter Error: {e}")
+            self.b, self.a, self.zi = None, None, None
+
+        self.filtered_emg_buffer[:] = 0.0
+        if hasattr(self, 'emg_curve'):
+            self.emg_curve.setData(self.filtered_emg_buffer)
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel(f"Device {self.index}")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(title)
+
+        # 1. EMG Plot
+        self.emg_plot = pg.PlotWidget(title="EMG data")
+        self.emg_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.emg_plot.setYRange(-3000, 3000)
+        self.emg_curve = self.emg_plot.plot(pen='g')
+        layout.addWidget(self.emg_plot)
+
+        # 2. Spectrum Bar Chart
+        self.sp_plot = pg.PlotWidget(title="Frequency Bins (Normalized)")
+        self.sp_plot.showGrid(x=False, y=True, alpha=0.3)
+        self.sp_plot.setMenuEnabled(False)
+        self.sp_plot.setMouseEnabled(x=False, y=False)
+
+        self.sp_bar_item = pg.BarGraphItem(
+            x=[0, 1, 2, 3], height=[0, 0, 0, 0], width=0.6, brushes=self.bar_colors
+        )
+        self.sp_plot.addItem(self.sp_bar_item)
+        ax = self.sp_plot.getPlotItem().getAxis('bottom')
+        ax.setTicks([[(0, 'SP0'), (1, 'SP1'), (2, 'SP2'), (3, 'SP3')]])
+        self.sp_plot.setYRange(0, 1.0)
+        layout.addWidget(self.sp_plot)
+
+        # 3. Accelerometer Plot
+        self.acc_plot = pg.PlotWidget(title="Accelerometer")
+        self.acc_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.acc_plot.setYRange(-20000, 20000)
+        self.acc_curve_x = self.acc_plot.plot(pen='r', name='ax')
+        self.acc_curve_y = self.acc_plot.plot(pen='y', name='ay')
+        self.acc_curve_z = self.acc_plot.plot(pen='b', name='az')
+        layout.addWidget(self.acc_plot)
+
+        # 4. Info Section
+        info_layout = QtWidgets.QVBoxLayout()
+        self.id_label = QtWidgets.QLabel("ID: N/A")
+        info_layout.addWidget(self.id_label)
+
+        rssi_layout = QtWidgets.QHBoxLayout()
+        rssi_layout.addWidget(QtWidgets.QLabel("RSSI:"))
+        self.rssi_bar = QtWidgets.QProgressBar()
+        self.rssi_bar.setRange(0, 100)
+        rssi_layout.addWidget(self.rssi_bar)
+        info_layout.addLayout(rssi_layout)
+
+        batt_layout = QtWidgets.QHBoxLayout()
+        batt_layout.addWidget(QtWidgets.QLabel("Battery:"))
+        self.batt_bar = QtWidgets.QProgressBar()
+        self.batt_bar.setRange(0, 100)
+        batt_layout.addWidget(self.batt_bar)
+        info_layout.addLayout(batt_layout)
+
+        self.compass_label = QtWidgets.QLabel("Compass: N/A")
+        info_layout.addWidget(self.compass_label)
+        layout.addLayout(info_layout)
+        layout.addStretch()
+
+    def update_from_device(self, dev):
+        if hasattr(dev, "unit_id"):
+            self.id_label.setText(f"ID: {dev.unit_id:08X}")
+
+        # EMG
+        if hasattr(dev, "data_array") and hasattr(dev, "data_count"):
+            samples = dev.data_array[:dev.data_count]
+            if len(samples) > 0:
+                shift = len(samples)
+                if shift >= self.emg_len:
+                    self.emg_buffer[:] = samples[-self.emg_len:]
+                else:
+                    self.emg_buffer = np.roll(self.emg_buffer, -shift)
+                    self.emg_buffer[-shift:] = samples
+
+                y = samples
+                if self.b is not None:
+                    y, self.zi = signal.lfilter(self.b, self.a, samples, zi=self.zi)
+
+                if shift >= self.emg_len:
+                    self.filtered_emg_buffer[:] = y[-self.emg_len:]
+                else:
+                    self.filtered_emg_buffer = np.roll(self.filtered_emg_buffer, -shift)
+                    self.filtered_emg_buffer[-shift:] = y
+
+                self.emg_curve.setData(self.filtered_emg_buffer)
+
+        # Spectrum (Normalized)
+        sp = list(getattr(dev, "device_spectr", []))
+        sp = (sp + [0] * 4)[:4]
+        max_val = max(sp) if sp else 0
+        if max_val > 0:
+            sp_norm = [x / max_val for x in sp]
+        else:
+            sp_norm = [0.0] * 4
+        self.sp_bar_item.setOpts(height=sp_norm)
+
+        # Accel
+        for buf, attr in zip((self.acc_x, self.acc_y, self.acc_z), ("ax", "ay", "az")):
+            val = getattr(dev, attr, None)
+            if val is not None:
+                buf[:] = np.roll(buf, -1)
+                buf[-1] = val
+        self.acc_curve_x.setData(self.acc_x)
+        self.acc_curve_y.setData(self.acc_y)
+        self.acc_curve_z.setData(self.acc_z)
+
+        # Info
+        rssi = getattr(dev, "rssi", 0)
+        if rssi > 0: self.rssi_bar.setValue(int(max(0, min(100, (90 - rssi) * 1.6))))
+        batt = getattr(dev, "batt", 0)
+        if batt > 0: self.batt_bar.setValue(int(max(0, min(100, (batt - 3100) / 10.0))))
+        mag = getattr(dev, "mag_angle", None)
+        if mag is not None:
+            self.compass_label.setText(f"Compass: {(math.degrees(mag) + 360) % 360:.1f}°")
+
+    def clear_panel(self):
+        self.id_label.setText("ID: N/A")
+
+
+# ---------- Gesture Dialogs ----------
+
+class GestureDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("הוספת מחווה חדשה")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel("שם תצוגה (עברית):"))
+        self.display_name = QtWidgets.QLineEdit()
+        layout.addWidget(self.display_name)
+        layout.addWidget(QtWidgets.QLabel("שם מפתח (אנגלית):"))
+        self.key_name = QtWidgets.QLineEdit()
+        layout.addWidget(self.key_name)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_data(self):
+        return self.display_name.text().strip(), self.key_name.text().strip().lower().replace(' ', '_')
+
+
+class GestureManagerDialog(QtWidgets.QDialog):
+    def __init__(self, gestures, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ניהול רשימת מחוות")
+        self.resize(400, 300)
+        self.gestures = gestures
+        self.init_ui()
+
+    def init_ui(self):
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QtWidgets.QWidget()
+        self.list_layout = QtWidgets.QVBoxLayout(self.container)
+
+        self.refresh_list()
+        self.scroll.setWidget(self.container)
+        self.main_layout.addWidget(self.scroll)
+
+        close_btn = QtWidgets.QPushButton("סגור")
+        close_btn.clicked.connect(self.accept)
+        self.main_layout.addWidget(close_btn)
+
+    def refresh_list(self):
+        while self.list_layout.count():
+            child = self.list_layout.takeAt(0)
+            if child.widget(): child.widget().deleteLater()
+
+        for idx, g in enumerate(self.gestures):
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            lbl = QtWidgets.QLabel(f"{g['display']} ({g['key']})")
+            edit_btn = QtWidgets.QPushButton("ערוך")
+            del_btn = QtWidgets.QPushButton("מחק")
+            del_btn.setStyleSheet("background-color: #ff4d4d; color: white;")
+            edit_btn.clicked.connect(lambda checked, i=idx: self.edit_gesture(i))
+            del_btn.clicked.connect(lambda checked, i=idx: self.delete_gesture(i))
+            row_layout.addWidget(lbl)
+            row_layout.addStretch()
+            row_layout.addWidget(edit_btn)
+            row_layout.addWidget(del_btn)
+            self.list_layout.addWidget(row)
+        self.list_layout.addStretch()
+
+    def edit_gesture(self, idx):
+        g = self.gestures[idx]
+        d, ok1 = QtWidgets.QInputDialog.getText(self, "עריכה", "שם תצוגה:", text=g['display'])
+        if ok1 and d:
+            k, ok2 = QtWidgets.QInputDialog.getText(self, "עריכה", "שם מפתח:", text=g['key'])
+            if ok2 and k:
+                self.gestures[idx] = {'display': d, 'key': k}
+                self.refresh_list()
+
+    def delete_gesture(self, idx):
+        ret = QtWidgets.QMessageBox.question(self, "מחיקה", "למחוק מחווה זו?",
+                                             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if ret == QtWidgets.QMessageBox.Yes:
+            self.gestures.pop(idx)
+            self.refresh_list()
+
+
+# ---------- Main GUI Window ----------
+
+class UmyoGui(QtWidgets.QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("uMyo Realtime Viewer & Gesture Recording *by NeuroBand")
+
+        # Icon Check
+        if os.path.exists("NeuroBand_logo.jpeg"):
+            self.setWindowIcon(QtGui.QIcon("NeuroBand_logo.jpeg"))
+        elif os.path.exists("logo.png"):
+            self.setWindowIcon(QtGui.QIcon("logo.png"))
+
+        self.resize(1600, 800)
+        pg.setConfigOptions(antialias=True)
+
+        self.gesture_file = "gestures.json"
+        self.subject_name = ""
+        self.save_directory = os.getcwd()
+
+        # Track last packet to prevent duplicates
+        self.last_logged_ids = {}
+        self.session_active = False
+        self.current_trial = 0
+        self.total_trials = 0
+        self.current_label = "at_rest"
+        self.full_session_data = []
+        self.session_start_time = 0.0
+
+        # Thread Safety
+        self.data_lock = threading.Lock()
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        main_layout = QtWidgets.QHBoxLayout(central)
+
+        # Left Panel (Devices)
+        self.max_devices_display = 3
+        panels_container = QtWidgets.QHBoxLayout()
+        self.filter_panel = FilterPanel()
+        DevicePanel.filter_panel = self.filter_panel
+
+        self.device_panels = []
+        for i in range(self.max_devices_display):
+            panel = DevicePanel(index=i)
+            self.device_panels.append(panel)
+            panels_container.addWidget(panel)
+        main_layout.addLayout(panels_container, stretch=3)
+
+        # Right Panel (Controls)
+        control_layout = QtWidgets.QVBoxLayout()
+
+        # Logo in Controls
+        logo_label = QtWidgets.QLabel()
+        logo_path = "logo.png"
+        if os.path.exists("NeuroBand_logo.jpeg"): logo_path = "NeuroBand_logo.jpeg"
+
+        if os.path.exists(logo_path):
+            pixmap = QtGui.QPixmap(logo_path)
+            pixmap = pixmap.scaledToWidth(150, QtCore.Qt.SmoothTransformation)
+            logo_label.setPixmap(pixmap)
+            logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            control_layout.addWidget(logo_label)
+            control_layout.addSpacing(10)
+
+        control_layout.addWidget(self.filter_panel)
+        control_layout.addSpacing(20)
+
+        control_layout.addWidget(QtWidgets.QLabel("הגדרת מחווה והקלטה:"))
+
+        # Gestures
+        control_layout.addWidget(QtWidgets.QLabel("סוג תנועה:"))
+        gesture_select_layout = QtWidgets.QHBoxLayout()
+        self.gesture_combo = QtWidgets.QComboBox()
+        self.load_gestures()
+        gesture_select_layout.addWidget(self.gesture_combo)
+
+        btn_add = QtWidgets.QPushButton("+")
+        btn_add.setFixedWidth(30)
+        btn_add.clicked.connect(self.open_gesture_dialog)
+
+        btn_manage = QtWidgets.QPushButton("⚙")
+        btn_manage.setFixedWidth(30)
+        btn_manage.clicked.connect(self.open_gesture_manager)
+
+        gesture_select_layout.addWidget(btn_add)
+        gesture_select_layout.addWidget(btn_manage)
+        control_layout.addLayout(gesture_select_layout)
+
+        # Settings
+        control_layout.addWidget(QtWidgets.QLabel("מספר חזרות:"))
+        self.reps_spin = QtWidgets.QSpinBox()
+        self.reps_spin.setRange(1, 100)
+        self.reps_spin.setValue(5)
+        control_layout.addWidget(self.reps_spin)
+
+        control_layout.addWidget(QtWidgets.QLabel("זמן הכנה (שניות):"))
+        self.pre_start_spin = QtWidgets.QDoubleSpinBox()
+        self.pre_start_spin.setValue(4.0)
+        control_layout.addWidget(self.pre_start_spin)
+
+        control_layout.addWidget(QtWidgets.QLabel("מרווח בין חזרות (שניות) - מנוחה:"))
+        self.interval_spin = QtWidgets.QDoubleSpinBox()
+        self.interval_spin.setValue(4.0)
+        control_layout.addWidget(self.interval_spin)
+
+        control_layout.addWidget(QtWidgets.QLabel("זמן הקלטה (שניות) - מחווה:"))
+        self.duration_spin = QtWidgets.QDoubleSpinBox()
+        self.duration_spin.setValue(3)
+        control_layout.addWidget(self.duration_spin)
+
+        control_layout.addWidget(QtWidgets.QLabel("פרמטר בדיקה (לקובץ):"))
+        self.param_input = QtWidgets.QLineEdit()
+        self.param_input.setPlaceholderText("לדוגמה: sensor_pos_1")
+        control_layout.addWidget(self.param_input)
+
+        control_layout.addWidget(QtWidgets.QLabel("תיקיית שמירה:"))
+        loc_layout = QtWidgets.QHBoxLayout()
+        self.save_loc_label = QtWidgets.QLineEdit(self.save_directory)
+        self.save_loc_label.setReadOnly(True)
+        loc_layout.addWidget(self.save_loc_label)
+
+        btn_browse = QtWidgets.QPushButton("...")
+        btn_browse.setFixedWidth(30)
+        btn_browse.clicked.connect(self.browse_save_location)
+        loc_layout.addWidget(btn_browse)
+        control_layout.addLayout(loc_layout)
+
+        # Indicators
+        control_layout.addWidget(QtWidgets.QLabel("חיווי הקלטה / טיימר:"))
+        self.led_frame = QtWidgets.QFrame()
+        self.led_frame.setFixedSize(40, 40)
+        self.led_frame.setStyleSheet("background-color: gray; border-radius: 20px;")
+        control_layout.addWidget(self.led_frame, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        self.countdown_label = QtWidgets.QLabel("")
+        self.countdown_label.setStyleSheet("font-size: 30px; font-weight: bold; color: red;")
+        self.countdown_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        control_layout.addWidget(self.countdown_label)
+
+        self.record_button = QtWidgets.QPushButton("התחל הקלטת מחווה")
+        self.record_button.clicked.connect(self.on_record_button_clicked)
+        control_layout.addWidget(self.record_button)
+
+        self.status_label = QtWidgets.QLabel("סטטוס: מוכן")
+        control_layout.addWidget(self.status_label)
+        control_layout.addStretch()
+        main_layout.addLayout(control_layout, stretch=1)
+
+        # Timers
+        self.trial_timer = QtCore.QTimer()
+        self.trial_timer.setSingleShot(True)
+        self.trial_timer.timeout.connect(self.end_current_phase)
+
+        self.countdown_update_timer = QtCore.QTimer()
+        self.countdown_update_timer.timeout.connect(self.update_countdown_display)
+        self.countdown_start_time = 0.0
+
+        self.phase_countdown_timer = QtCore.QTimer()
+        self.phase_countdown_timer.timeout.connect(self.update_phase_countdown_display)
+        self.phase_end_time = 0.0
+
+        # VISUAL TIMER (Slow ~30Hz)
+        self.gui_timer = QtCore.QTimer()
+        self.gui_timer.timeout.connect(self.update_visuals_only)
+        self.gui_timer.start(30)
+
+        # --- INITIALIZE SERIAL THREAD LAST ---
+        # Prevents race conditions where callback runs before UI is ready
+        self.serial_thread = SerialReader(callback=self.on_serial_data)
+        self.serial_thread.start()
+
+    # --- SERIAL CALLBACK (Fast Data Logging) ---
+    def on_serial_data(self):
+        # Triggered by Serial Thread >100Hz
+        # We must use a lock if we interact with shared data that main thread uses
+        if self.session_active:
+            devs = umyo_parser.umyo_get_list()
+            for i, d in enumerate(devs):
+                self.collect_data(i, d)
+
+    # --- GUI UPDATE (Slow Visualization) ---
+    def update_visuals_only(self):
+        devs = umyo_parser.umyo_get_list()
+        for i, p in enumerate(self.device_panels):
+            if i < len(devs):
+                p.update_from_device(devs[i])
+            else:
+                p.clear_panel()
+
+    # --- DATA COLLECTION LOGIC ---
+    def collect_data(self, idx, dev):
+        """Saves data in Parallel Format (1 row = 8 channels)."""
+        if not hasattr(dev, "data_array"): return
+
+        # 1. Deduplication using data_id
+        uid = getattr(dev, "unit_id", 0)
+        did = getattr(dev, "data_id", 0)
+
+        # Simple read is thread-safe enough for this int
+        if self.last_logged_ids.get(uid) == did:
+            return  # Duplicate
+        self.last_logged_ids[uid] = did
+
+        # 2. Get Data
+        raw_data = getattr(dev, "data_array", [])
+        cnt = getattr(dev, "data_count", len(raw_data))
+        valid_data = raw_data[:cnt]
+
+        # Pad to 8 channels
+        emg_padded = (list(valid_data) + [None] * 8)[:8]
+
+        # Metadata
+        sp = list(getattr(dev, "device_spectr", [])) + [None] * 4
+        rssi = getattr(dev, "rssi", 0)
+        ax, ay, az = getattr(dev, "ax", 0), getattr(dev, "ay", 0), getattr(dev, "az", 0)
+
+        # Timing
+        now = time.time()
+        t_rel_start = now - self.session_start_time if self.session_start_time > 0 else 0
+        dt = datetime.now()
+        d_str, t_str = dt.strftime("%d-%m-%y"), dt.strftime("%H:%M:%S.%f")[:-3]
+
+        trial = self.current_trial if self.current_label != "at_rest" or self.current_trial > 0 else 0
+
+        # 3. Store in Memory (Thread Safe)
+        with self.data_lock:
+            self.full_session_data.append({
+                "gesture_label": self.current_label,
+                "trial_index": trial,
+                "unit_id": uid,
+                "rssi": rssi,
+                "date": d_str,
+                "clock_time": t_str,
+                "subject_name": self.subject_name,
+                "t": t_rel_start,
+                "emg_channels": emg_padded,
+                "sp0": sp[0], "sp1": sp[1], "sp2": sp[2], "sp3": sp[3],
+                "ax": ax, "ay": ay, "az": az,
+                "device_index": idx
+            })
+
+    # --- FILE SYSTEM ---
+    def browse_save_location(self):
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(self, "בחר תיקייה לשמירה", self.save_directory)
+        if dir_path:
+            self.save_directory = dir_path
+            self.save_loc_label.setText(dir_path)
+
+    # --- GESTURE MANAGEMENT ---
+    def load_gestures(self):
+        if os.path.exists(self.gesture_file):
+            try:
+                with open(self.gesture_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for item in data:
+                        self.gesture_combo.addItem(item['display'], userData=item['key'])
+            except:
+                self.populate_default_gestures()
+        else:
+            self.populate_default_gestures()
+
+    def populate_default_gestures(self):
+        self.gesture_combo.clear()
+        defaults = [("אגרוף", "fist"), ("כפיפת כף יד", "wrist_flexion"),
+                    ("יישור כף יד", "wrist_extension"), ("תנועה אקראית", "random")]
+        for d, k in defaults:
+            self.gesture_combo.addItem(d, userData=k)
+
+    def save_gestures(self):
+        data = []
+        for i in range(self.gesture_combo.count()):
+            data.append({
+                'display': self.gesture_combo.itemText(i),
+                'key': self.gesture_combo.itemData(i)
+            })
+        try:
+            with open(self.gesture_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"Error saving gestures: {e}")
+
+    def open_gesture_dialog(self):
+        dialog = GestureDialog(self)
+        if dialog.exec():
+            d, k = dialog.get_data()
+            if d and k:
+                self.gesture_combo.addItem(d, userData=k)
+                self.save_gestures()
+                self.status_label.setText(f"נוספה: {d}")
+
+    def open_gesture_manager(self):
+        current_gestures = []
+        for i in range(self.gesture_combo.count()):
+            current_gestures.append({
+                'display': self.gesture_combo.itemText(i),
+                'key': self.gesture_combo.itemData(i)
+            })
+
+        manager = GestureManagerDialog(current_gestures, self)
+        if manager.exec():
+            self.gesture_combo.clear()
+            for g in current_gestures:
+                self.gesture_combo.addItem(g['display'], userData=g['key'])
+            self.save_gestures()
+            self.status_label.setText("רשימת מחוות עודכנה")
+
+    # --- SESSION LOGIC ---
+    def set_led(self, state: str):
+        if state == 'record':
+            self.led_frame.setStyleSheet("background-color: red; border-radius: 20px;")
+        elif state == 'rest':
+            self.led_frame.setStyleSheet("background-color: yellow; border-radius: 20px;")
+        else:
+            self.led_frame.setStyleSheet("background-color: gray; border-radius: 20px;")
+
+    def on_record_button_clicked(self):
+        if not self.session_active:
+            self.start_session()
+        else:
+            self.stop_session("נעצר ידנית", should_save=True)
+
+    def start_session(self):
+        text, ok = QtWidgets.QInputDialog.getText(self, "Subject", "Enter subject name:")
+        if not ok or not text.strip():
+            self.status_label.setText("בוטל: חסר שם נבדק")
+            return
+        self.subject_name = text.strip()
+
+        self.total_trials = self.reps_spin.value()
+        self.current_trial = 0
+        self.session_active = True
+        self.current_label = "beginning"
+        self.full_session_data = []
+        self.session_start_time = 0.0
+        self.record_button.setText("עצור הקלטה ושמור")
+
+        # Disable Inputs
+        self.gesture_combo.setEnabled(False)
+        self.reps_spin.setEnabled(False)
+        self.interval_spin.setEnabled(False)
+        self.duration_spin.setEnabled(False)
+        self.pre_start_spin.setEnabled(False)
+        self.param_input.setEnabled(False)
+
+        # Pre-start
+        self.countdown_start_time = time.time() + self.pre_start_spin.value()
+        self.status_label.setText("מתחיל ספירה לאחור...")
+        self.countdown_update_timer.start(100)
+
+        if self.pre_start_spin.value() == 0.0:
+            self.countdown_label.setText("START!")
+            self.countdown_update_timer.stop()
+            self._start_rest_phase()
+
+    def update_countdown_display(self):
+        left = self.countdown_start_time - time.time()
+        if left > 0:
+            self.countdown_label.setText(f"recording in: {int(math.ceil(left))}")
+            self.set_led('rest')
+        else:
+            self.countdown_label.setText("START!")
+            self.countdown_update_timer.stop()
+            self._start_rest_phase()
+
+    def _start_rest_phase(self):
+        if not self.session_active: return
+        if self.session_start_time == 0.0: self.session_start_time = time.time()
+
+        if self.current_trial >= self.total_trials and self.current_trial > 0:
+            self.stop_session("Session הושלם", should_save=True)
+            return
+
+        interval = self.interval_spin.value()
+        self.current_label = "at_rest"
+        self.status_label.setText(f"במנוחה - מחכה {interval} שניות...")
+        self.set_led('rest')
+
+        self.trial_timer.start(int(interval * 1000))
+        self.phase_end_time = time.time() + interval
+        self.phase_countdown_timer.start(100)
+
+    def _start_recording_phase(self):
+        if not self.session_active: return
+        self.current_trial += 1
+
+        dur = self.duration_spin.value()
+        self.current_label = self.gesture_combo.currentData()
+        name = self.gesture_combo.currentText()
+
+        self.status_label.setText(f"מבצע מחווה: {name} ({self.current_trial}/{self.total_trials})")
+        self.set_led('record')
+
+        self.trial_timer.start(int(dur * 1000))
+        self.phase_end_time = time.time() + dur
+        self.phase_countdown_timer.start(100)
+
+    def update_phase_countdown_display(self):
+        left = self.phase_end_time - time.time()
+        if left > 0:
+            disp = int(math.ceil(left))
+            if self.current_label == "at_rest":
+                self.countdown_label.setText(f"resting... {disp}")
+            else:
+                g_name = self.gesture_combo.currentText()
+                self.countdown_label.setText(f"{g_name}... {disp}")
+        else:
+            self.phase_countdown_timer.stop()
+            self.countdown_label.setText(self.current_label.upper())
+
+    def end_current_phase(self):
+        self.phase_countdown_timer.stop()
+        if self.current_label == self.gesture_combo.currentData():
+            self._start_rest_phase()
+        elif self.current_label == "at_rest":
+            self._start_recording_phase()
+        else:
+            self.stop_session("Logic Error")
+
+    def stop_session(self, reason, should_save=False):
+        self.session_active = False
+        self.trial_timer.stop()
+        self.countdown_update_timer.stop()
+        self.phase_countdown_timer.stop()
+        self.set_led('off')
+        self.countdown_label.setText("")
+        self.record_button.setText("התחל הקלטת מחווה")
+
+        self.gesture_combo.setEnabled(True)
+        self.reps_spin.setEnabled(True)
+        self.interval_spin.setEnabled(True)
+        self.duration_spin.setEnabled(True)
+        self.pre_start_spin.setEnabled(True)
+        self.param_input.setEnabled(True)
+
+        if should_save:
+            self._save_file()
+        else:
+            self.status_label.setText(f"{reason}")
+
+    # --- FILE SAVING ---
+    def _save_file(self):
+        # Thread safety: Acquire lock before reading/clearing list
+        with self.data_lock:
+            if not self.full_session_data: return
+            data_to_save = list(self.full_session_data)
+            self.full_session_data.clear()
+
+        g_key = self.gesture_combo.currentData()
+        subj = self.subject_name.replace(" ", "_")
+        dt = datetime.now()
+
+        param_raw = self.param_input.text().strip()
+        param_clean = re.sub(r'[\\/*?:"<>|]', "", param_raw).replace(" ", "_")
+        param_txt = f", {param_clean}" if param_clean else ""
+
+        fname = f"{subj}, {g_key}{param_txt}, {dt.strftime('%H-%M-%S')}, {dt.strftime('%d-%m-%y')}.csv"
+        full_path = os.path.join(self.save_directory, fname)
+
+        if os.path.exists(full_path):
+            base, ext = os.path.splitext(full_path)
+            idx = 1
+            while os.path.exists(f"{base}_{idx}{ext}"): idx += 1
+            full_path = f"{base}_{idx}{ext}"
+
+        try:
+            with open(full_path, "w", newline="", encoding="utf-8") as f:
+                # HEADERS: Metadata + 8 EMG Columns + Spectrum + IMU
+                headers = [
+                    "gesture_label", "trial_index", "unit_id", "rssi",
+                    "date", "clock_time", "subject_name", "timestamp"
+                ]
+                headers.extend([f"emg_{i}" for i in range(8)])
+                headers.extend(["sp0", "sp1", "sp2", "sp3", "ax", "ay", "az"])
+
+                writer = csv.writer(f)
+                writer.writerow(headers)
+
+                for r in data_to_save:
+                    uid_str = f"{r['unit_id']:08X}" if isinstance(r['unit_id'], int) else str(r['unit_id'])
+
+                    row = [
+                        r["gesture_label"],
+                        r["trial_index"],
+                        uid_str,
+                        r["rssi"],
+                        r["date"],
+                        r["clock_time"],
+                        r["subject_name"],
+                        f"{r['t']:.6f}"
+                    ]
+
+                    # Add Parallel EMG columns
+                    row.extend(r["emg_channels"])
+
+                    row.extend([
+                        r["sp0"], r["sp1"], r["sp2"], r["sp3"],
+                        r["ax"], r["ay"], r["az"]
+                    ])
+
+                    writer.writerow(row)
+
+            self.status_label.setText(f"נשמר: {os.path.basename(full_path)}")
+        except PermissionError:
+            QtWidgets.QMessageBox.critical(self, "שגיאה", "הקובץ פתוח בתוכנה אחרת (Excel). אנא סגור אותו ונסה שוב.")
+        except Exception as e:
+            self.status_label.setText(f"שגיאה: {e}")
+            print(f"Save error: {e}")
+
+
+def main():
+    # Don't start thread here, UmyoGui does it.
+    app = QtWidgets.QApplication(sys.argv)
+    gui = UmyoGui()
+
+    # Ensure clean thread exit
+    app.aboutToQuit.connect(lambda: (gui.serial_thread.stop(), gui.serial_thread.join(1.0)))
+
+    gui.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
