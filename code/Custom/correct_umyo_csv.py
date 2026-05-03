@@ -4,8 +4,8 @@ import os
 import glob
 
 # --- CONFIGURATION ---
-INPUT_FOLDER = r"C:\Users\Nadav\OneDrive - Afeka College Of Engineering\uMyo Python Project - test\Custom_files\wrong data"   # <--- Update this path
-OUTPUT_FOLDER = r"C:\Users\Nadav\OneDrive - Afeka College Of Engineering\uMyo Python Project - test\Custom_files"  # <--- Update this path
+INPUT_FOLDER = r"B:\OneDrive - Afeka College Of Engineering\פרויקט גמר\Intra-Subject Test"   # <--- Update this path
+OUTPUT_FOLDER = r"B:\OneDrive - Afeka College Of Engineering\פרויקט גמר\Intra-Subject Test\corrercted files"  # <--- Update this path
 
 # Create output folder if it doesn't exist
 if not os.path.exists(OUTPUT_FOLDER):
@@ -54,6 +54,16 @@ def transform_file(file_path):
             ax = group['ax'].values[::8]
             ay = group['ay'].values[::8]
             az = group['az'].values[::8]
+            trial_index = (
+            group['trial_index'].values[::8]
+            if 'trial_index' in group.columns
+            else np.full(n_packets, np.nan)
+            )
+            gesture_label = (
+            group['gesture_label'].values[::8]
+            if 'gesture_label' in group.columns
+            else np.full(n_packets, np.nan)
+            )
             
             # Optional: Preserve labels if they exist (just taking the first one)
             # gesture = group['gesture_label'].values[::8] if 'gesture_label' in group.columns else None
@@ -61,6 +71,8 @@ def transform_file(file_path):
             # Create the new DataFrame block
             new_df = pd.DataFrame({
                 'timestamp': timestamps,
+                'trial_index': trial_index,
+                'gesture_label': gesture_label,
                 'device_id': unit_id,
                 'emg_ch_0': emg_matrix[:, 0],
                 'emg_ch_1': emg_matrix[:, 1],
@@ -92,7 +104,7 @@ def transform_file(file_path):
         # --- FINAL FORMATTING ---
         # Add missing columns found in the "correct" format (filled with NaN)
         target_cols = [
-            'timestamp', 'device_id', 'data_id', 'rssi', 'battery_mv', 'emg_sample_count', 
+            'timestamp', 'trial_index', 'gesture_label', 'device_id', 'data_id', 'rssi', 'battery_mv', 'emg_sample_count', 
             'emg_ch_0', 'emg_ch_1', 'emg_ch_2', 'emg_ch_3', 'emg_ch_4', 'emg_ch_5', 'emg_ch_6', 'emg_ch_7', 
             'spectrum_0', 'spectrum_1', 'spectrum_2', 'spectrum_3', 
             'quat_w', 'quat_x', 'quat_y', 'quat_z', 
