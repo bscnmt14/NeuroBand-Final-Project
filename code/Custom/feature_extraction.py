@@ -36,10 +36,12 @@ def calc_emav(emg_signals):
     Applies weighting to emphasize the middle of the window.
     """
     N = emg_signals.shape[0]
+
     p = np.full((N, 1), 0.5)
 
     start_idx = int(0.2 * N)
     end_idx = int(0.8 * N)
+
     p[start_idx:end_idx + 1] = 0.75
 
     return np.mean(np.abs(emg_signals) ** p, axis=0)
@@ -63,7 +65,9 @@ def calc_ssc(emg_signals, threshold):
     Counts local peaks and valleys with threshold filtering.
     """
     diffs = np.diff(emg_signals, axis=0)
+
     ssc_products = -diffs[:-1] * diffs[1:]
+
     return np.sum(ssc_products >= threshold, axis=0)
 
 
@@ -73,8 +77,8 @@ def calc_ssc(emg_signals, threshold):
 
 def extract_all_features(
     df,
-    window_size=300,
-    step_size=100,
+    window_size=200,
+    step_size=50,
     zc_thresh=0.01,
     ssc_delta=0.01,
     subject_id=1,
@@ -82,82 +86,140 @@ def extract_all_features(
     label_map=None
 ):
     """
-    Extracts time-domain EMG features using a sliding window approach.
+    Extracts EMG and SP features using a sliding window approach.
 
     Parameters:
-    - df: Input DataFrame containing EMG signals and labels
-    - window_size: Number of samples per window
-    - step_size: Step size between consecutive windows
-    - zc_thresh: Threshold for Zero Crossing
-    - ssc_delta: Threshold for Slope Sign Change
-    - subject_id: Identifier for the subject
-    - dataset_type: Dataset category (e.g., intra/inter subject)
-    - label_map: Optional dictionary for label encoding
+    ----------
+    df : pandas.DataFrame
+        Input dataframe containing:
+        - EMG channels (emg_ch_*)
+        - SP channels (sp_ch_*)
+        - gesture_label column
+
+    window_size : int
+        Number of samples per window.
+
+    step_size : int
+        Step size between consecutive windows.
+
+    zc_thresh : float
+        Threshold for Zero Crossing feature.
+
+    ssc_delta : float
+        Threshold for Slope Sign Change feature.
+
+    subject_id : int
+        Subject identifier.
+
+    dataset_type : str
+        Dataset category.
+
+    label_map : dict or None
+        Optional label encoding dictionary.
 
     Returns:
-    - features_df: DataFrame with extracted features
-    - label_map: Mapping from gesture_label to numeric label_id
+    -------
+    features_df : pandas.DataFrame
+        Extracted feature matrix.
+
+    label_map : dict
+        Mapping from gesture labels to numeric IDs.
     """
 
     if df.empty:
         return pd.DataFrame(), {}
 
     # ------------------------
-    # Data cleaning
+    # Data Cleaning
     # ------------------------
 
-    # Remove non-gesture segments
+    # Remove non-gesture regions
     df = df[df['gesture_label'] != 'beginning'].copy()
 
-    # Create label mapping if not provided
+    # Create label encoding automatically if not provided
     if label_map is None:
         unique_labels = sorted(df['gesture_label'].unique())
-        label_map = {label: idx for idx, label in enumerate(unique_labels)}
+        label_map = {
+            label: idx for idx, label in enumerate(unique_labels)
+        }
 
-    # Add numeric label column for ML models
+    # Add numeric labels
     df['label_id'] = df['gesture_label'].map(label_map)
 
-    # Add metadata columns
+    # Add metadata
     df['Subject'] = subject_id
     df['dataset_type'] = dataset_type
 
-    # Identify EMG channels automatically
+    # ------------------------
+    # Channel Detection
+    # ------------------------
+
     emg_cols = [col for col in df.columns if 'emg_ch' in col]
     sp_cols = [col for col in df.columns if 'sp_ch' in col]
 
     if len(emg_cols) == 0:
-        raise ValueError("No EMG channels found (expected columns containing 'emg_ch')")
+        raise ValueError(
+            "No EMG channels found "
+            "(expected columns containing 'emg_ch')"
+        )
 
-    print(f"Found {len(emg_cols)} EMG channels and {len(sp_cols)} SP channels")
+    print(f"Found {len(emg_cols)} EMG channels")
+    print(f"Found {len(sp_cols)} SP channels")
 
     features = []
 
     print("Extracting features...")
 
     # ------------------------
-    # Sliding window processing
+    # Sliding Window Processing
     # ------------------------
 
     for start in range(0, len(df) - window_size, step_size):
+
         end = start + window_size
+
         window_data = df.iloc[start:end]
 
-        # Skip windows containing multiple gestures (transition regions)
+        # Skip transition windows
         if window_data['gesture_label'].nunique() > 1:
             continue
 
+        # Extract EMG and SP signals
         emg_signals = window_data[emg_cols].values
-        sp_signals = window_data[sp_cols].values if len(sp_cols) > 0 else None
-        # Compute features
-        rms = calc_rms(emg_signals)
-        var = calc_var(emg_signals)
-        wl = calc_wl(emg_signals)
-        emav = calc_emav(emg_signals)
-        zc = calc_zc(emg_signals, zc_thresh)
-        ssc = calc_ssc(emg_signals, ssc_delta)
-        sp_mean = np.mean(sp_signals, axis=0)
 
-        # Store metadata for the window
+        sp_signals = (
+            window_data[sp_cols].values
+            if len(sp_cols) > 0
+            else None
+        )
+
+        # ------------------------
+        # EMG Feature Extraction
+        # ------------------------
+
+        rms = calc_rms(emg_signals)
+
+        var = calc_var(emg_signals)
+
+        wl = calc_wl(emg_signals)
+
+        emav = calc_emav(emg_signals)
+
+        zc = calc_zc(emg_signals, zc_thresh)
+
+        ssc = calc_ssc(emg_signals, ssc_delta)
+
+        # ------------------------
+        # SP Temporal Averaging
+        # ------------------------
+
+        if sp_signals is not None:
+            sp_mean = np.mean(sp_signals, axis=0)
+
+        # ------------------------
+        # Create Feature Vector
+        # ------------------------
+
         row_info = {
             'gesture_label': window_data['gesture_label'].iloc[0],
             'label_id': window_data['label_id'].iloc[0],
@@ -165,8 +227,9 @@ def extract_all_features(
             'dataset_type': dataset_type
         }
 
-        # Flatten feature vectors into a single row
+        # Add EMG features
         for i, col in enumerate(emg_cols):
+
             row_info[f'{col}_RMS'] = rms[i]
             row_info[f'{col}_VAR'] = var[i]
             row_info[f'{col}_WL'] = wl[i]
@@ -174,9 +237,15 @@ def extract_all_features(
             row_info[f'{col}_ZC'] = zc[i]
             row_info[f'{col}_SSC'] = ssc[i]
 
-        for i, col in enumerate(sp_cols):
-            row_info[f'{col}_MEAN'] = sp_mean[i]
+        # Add SP temporal averages
+        if sp_signals is not None:
+
+            for i, col in enumerate(sp_cols):
+
+                row_info[f'{col}_MEAN'] = sp_mean[i]
 
         features.append(row_info)
 
-    return pd.DataFrame(features), label_map
+    features_df = pd.DataFrame(features)
+
+    return features_df, label_map
