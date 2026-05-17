@@ -1,6 +1,5 @@
-import numpy as np
 import pandas as pd
-
+import numpy as np
 
 # ========================
 # Feature Calculations
@@ -13,14 +12,12 @@ def calc_rms(emg_signals):
     """
     return np.sqrt(np.mean(emg_signals ** 2, axis=0))
 
-
 def calc_var(emg_signals):
     """
     Variance (VAR)
     Measures signal dispersion around the mean.
     """
     return np.var(emg_signals, axis=0)
-
 
 def calc_wl(emg_signals):
     """
@@ -29,14 +26,12 @@ def calc_wl(emg_signals):
     """
     return np.sum(np.abs(np.diff(emg_signals, axis=0)), axis=0)
 
-
 def calc_emav(emg_signals):
     """
     Enhanced Mean Absolute Value (EMAV)
     Applies weighting to emphasize the middle of the window.
     """
     N = emg_signals.shape[0]
-
     p = np.full((N, 1), 0.5)
 
     start_idx = int(0.2 * N)
@@ -45,7 +40,6 @@ def calc_emav(emg_signals):
     p[start_idx:end_idx + 1] = 0.75
 
     return np.mean(np.abs(emg_signals) ** p, axis=0)
-
 
 def calc_zc(emg_signals, threshold):
     """
@@ -58,194 +52,87 @@ def calc_zc(emg_signals, threshold):
         axis=0
     )
 
-
 def calc_ssc(emg_signals, threshold):
     """
     Slope Sign Changes (SSC)
     Counts local peaks and valleys with threshold filtering.
     """
     diffs = np.diff(emg_signals, axis=0)
-
     ssc_products = -diffs[:-1] * diffs[1:]
-
     return np.sum(ssc_products >= threshold, axis=0)
 
-
 # ========================
-# Main Extraction Function
+# Feature Extraction Logic
 # ========================
 
-def extract_all_features(
-    df,
-    window_size=200,
-    step_size=50,
-    zc_thresh=0.01,
-    ssc_delta=0.01,
-    subject_id=1,
-    dataset_type="intra_subject",
-    label_map=None
-):
+def extract_features(sensor_data_dict, margin_ms=100.0, window_ms=300.0, step_ms=None, fs=1100.0, 
+                     zc_volt_thresh=1e-6, ssc_volt_thresh=1e-6):
     """
-    Extracts EMG and SP features using a sliding window approach.
-
-    Parameters:
-    ----------
-    df : pandas.DataFrame
-        Input dataframe containing:
-        - EMG channels (emg_ch_*)
-        - SP channels (sp_ch_*)
-        - gesture_label column
-
-    window_size : int
-        Number of samples per window.
-
-    step_size : int
-        Step size between consecutive windows.
-
-    zc_thresh : float
-        Threshold for Zero Crossing feature.
-
-    ssc_delta : float
-        Threshold for Slope Sign Change feature.
-
-    subject_id : int
-        Subject identifier.
-
-    dataset_type : str
-        Dataset category.
-
-    label_map : dict or None
-        Optional label encoding dictionary.
-
-    Returns:
-    -------
-    features_df : pandas.DataFrame
-        Extracted feature matrix.
-
-    label_map : dict
-        Mapping from gesture labels to numeric IDs.
+    Applies margins, splits into sliding windows, and extracts features.
+    Allows independent voltage thresholds for Zero Crossings (ZC) and Slope Sign Changes (SSC).
+    Both inputs are in Volts (e.g., 1e-6 for 1 uV).
     """
+    if step_ms is None:
+        step_ms = window_ms / 2.0
+        
+    # Time-to-row math
+    margin_rows = int(round((margin_ms / 1000.0) * fs / 8.0))
+    window_rows = int(round((window_ms / 1000.0) * fs / 8.0))
+    step_rows = int(round((step_ms / 1000.0) * fs / 8.0))
+    
+    window_rows, step_rows, margin_rows = max(1, window_rows), max(1, step_rows), max(0, margin_rows)
 
-    if df.empty:
-        return pd.DataFrame(), {}
+    # =========================================================================
+    # SEPARATE THRESHOLD MANAGEMENT:
+    # ZC threshold maps 1-to-1 with Volts.
+    # SSC threshold is squared internally to match the Volts^2 mathematical dimension.
+    # =========================================================================
+    zc_threshold_final = zc_volt_thresh
+    ssc_threshold_final = ssc_volt_thresh ** 2
 
-    # ------------------------
-    # Data Cleaning
-    # ------------------------
+    print(f"\nExtracting Features | Window: {window_ms}ms | Step: {step_ms}ms")
+    print(f" -> ZC Amplitude Threshold:  {zc_volt_thresh} Volts")
+    print(f" -> SSC Amplitude Threshold: {ssc_volt_thresh} Volts (Internal Math: {ssc_threshold_final:.2e} Volts²)")
+    
+    emg_cols = [f'emg_ch_{i}' for i in range(8)]
+    all_features = []
 
-    # Remove non-gesture regions
-    df = df[df['gesture_label'] != 'beginning'].copy()
+    for sensor_id, gestures in sensor_data_dict.items():
+        for gesture_type, df in gestures.items():
+            if df is None or df.empty: continue
+            
+            for trial_idx in df['trial_index'].unique():
+                trial_df = df[df['trial_index'] == trial_idx].copy()
+                
+                # Apply Margins
+                if len(trial_df) > (2 * margin_rows):
+                    if margin_rows > 0:
+                        trial_df = trial_df.iloc[margin_rows : -margin_rows]
+                else:
+                    continue
+                
+                # Sliding Windows
+                for start_idx in range(0, len(trial_df) - window_rows + 1, step_rows):
+                    window_df = trial_df.iloc[start_idx : start_idx + window_rows]
+                    
+                    window_emg_1d = window_df[emg_cols].values.flatten()
+                    emg_matrix = window_emg_1d.reshape(-1, 1)
+                    
+                    # Calculate features using independent thresholds
+                    feat_row = {
+                        'sensor_id': sensor_id,
+                        'gesture_label': window_df['gesture_label'].iloc[0],
+                        'trial_index': trial_idx,
+                        'feat_rms': calc_rms(emg_matrix)[0],
+                        'feat_var': calc_var(emg_matrix)[0],
+                        'feat_wl': calc_wl(emg_matrix)[0],
+                        'feat_emav': calc_emav(emg_matrix)[0],
+                        'feat_zc': calc_zc(emg_matrix, zc_threshold_final)[0],
+                        'feat_ssc': calc_ssc(emg_matrix, ssc_threshold_final)[0],
+                        'sp_1': window_df['spectrum_1'].mean(),
+                        'sp_2': window_df['spectrum_2'].mean(),
+                        'sp_3': window_df['spectrum_3'].mean()
+                    }
+                    all_features.append(feat_row)
 
-    # Create label encoding automatically if not provided
-    if label_map is None:
-        unique_labels = sorted(df['gesture_label'].unique())
-        label_map = {
-            label: idx for idx, label in enumerate(unique_labels)
-        }
-
-    # Add numeric labels
-    df['label_id'] = df['gesture_label'].map(label_map)
-
-    # Add metadata
-    df['Subject'] = subject_id
-    df['dataset_type'] = dataset_type
-
-    # ------------------------
-    # Channel Detection
-    # ------------------------
-
-    emg_cols = [col for col in df.columns if 'emg_ch' in col]
-    sp_cols = [col for col in df.columns if 'sp_ch' in col]
-
-    if len(emg_cols) == 0:
-        raise ValueError(
-            "No EMG channels found "
-            "(expected columns containing 'emg_ch')"
-        )
-
-    print(f"Found {len(emg_cols)} EMG channels")
-    print(f"Found {len(sp_cols)} SP channels")
-
-    features = []
-
-    print("Extracting features...")
-
-    # ------------------------
-    # Sliding Window Processing
-    # ------------------------
-
-    for start in range(0, len(df) - window_size, step_size):
-
-        end = start + window_size
-
-        window_data = df.iloc[start:end]
-
-        # Skip transition windows
-        if window_data['gesture_label'].nunique() > 1:
-            continue
-
-        # Extract EMG and SP signals
-        emg_signals = window_data[emg_cols].values
-
-        sp_signals = (
-            window_data[sp_cols].values
-            if len(sp_cols) > 0
-            else None
-        )
-
-        # ------------------------
-        # EMG Feature Extraction
-        # ------------------------
-
-        rms = calc_rms(emg_signals)
-
-        var = calc_var(emg_signals)
-
-        wl = calc_wl(emg_signals)
-
-        emav = calc_emav(emg_signals)
-
-        zc = calc_zc(emg_signals, zc_thresh)
-
-        ssc = calc_ssc(emg_signals, ssc_delta)
-
-        # ------------------------
-        # SP Temporal Averaging
-        # ------------------------
-
-        if sp_signals is not None:
-            sp_mean = np.mean(sp_signals, axis=0)
-
-        # ------------------------
-        # Create Feature Vector
-        # ------------------------
-
-        row_info = {
-            'gesture_label': window_data['gesture_label'].iloc[0],
-            'label_id': window_data['label_id'].iloc[0],
-            'Subject': subject_id,
-            'dataset_type': dataset_type
-        }
-
-        # Add EMG features
-        for i, col in enumerate(emg_cols):
-
-            row_info[f'{col}_RMS'] = rms[i]
-            row_info[f'{col}_VAR'] = var[i]
-            row_info[f'{col}_WL'] = wl[i]
-            row_info[f'{col}_EMAV'] = emav[i]
-            row_info[f'{col}_ZC'] = zc[i]
-            row_info[f'{col}_SSC'] = ssc[i]
-
-        # Add SP temporal averages
-        if sp_signals is not None:
-
-            for i, col in enumerate(sp_cols):
-
-                row_info[f'{col}_MEAN'] = sp_mean[i]
-
-        features.append(row_info)
-
-    features_df = pd.DataFrame(features)
-
-    return features_df, label_map
+    return pd.DataFrame(all_features)
