@@ -150,7 +150,7 @@ def plot_emg_from_file(file_path, bpf_params, adc_to_uv_factor=1.0, apply_filter
 if __name__ == "__main__":
     
     # 1. FILE PATH CONFIGURATION
-    SINGLE_FILE_PATH = r"B:\OneDrive - Afeka College Of Engineering\פרויקט גמר\Intra-Subject Test\Files for test\Fixed_Tal, pinch, Sensor_Drift_effect_0, 13-51-59, 30-12-25.csv"
+    SINGLE_FILE_PATH = r"B:\OneDrive - Afeka College Of Engineering\פרויקט גמר\Intra-Subject Test\Files for test\Fixed_Tal, pinch, muscle_mass, 23-21-49, 30-12-25.csv"
     
     # ==========================================
     # 2. FILTER TOGGLE (True = Filtered, False = Raw)
@@ -159,13 +159,13 @@ if __name__ == "__main__":
     
     # 3. BPF CONFIGURATION
     bpf_parameters = {
-        'lowcut': 25.0,
-        'highcut': 499.0, 
-        'fs': 1100.0,
+        'lowcut': 35,
+        'highcut': 499, 
+        'fs': 1100,
         'order': 4
     }
     
-    # 4. MILLIVOLT CONVERSION 
+    # 4. MICROVOLT CONVERSION 
     UV_CONVERSION_FACTOR = 1.0 
     
     plot_emg_from_file(

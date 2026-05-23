@@ -1,5 +1,7 @@
+# feature_extraction.py
 import pandas as pd
 import numpy as np
+import hyper_parameters as hp  # <--- Importing the central control board
 
 # ========================
 # Feature Calculations
@@ -65,15 +67,18 @@ def calc_ssc(emg_signals, threshold):
 # Feature Extraction Logic
 # ========================
 
-def extract_features(sensor_data_dict, margin_ms=100.0, window_ms=300.0, step_ms=None, fs=1100.0, 
-                     zc_volt_thresh=1e-6, ssc_volt_thresh=1e-6):
+def extract_features(sensor_data_dict):
     """
     Applies margins, splits into sliding windows, and extracts features.
-    Allows independent voltage thresholds for Zero Crossings (ZC) and Slope Sign Changes (SSC).
-    Both inputs are in Volts (e.g., 1e-6 for 1 uV).
+    Reads all configuration parameters directly from hyper_parameters.py.
     """
-    if step_ms is None:
-        step_ms = window_ms / 2.0
+    # Read directly from hp
+    window_ms = hp.WINDOW_MS
+    step_ms = hp.STEP_MS
+    margin_ms = hp.MARGIN_MS
+    fs = hp.FS
+    zc_volt_thresh = hp.ZC_VOLT_THRESH
+    ssc_volt_thresh = hp.SSC_VOLT_THRESH
         
     # Time-to-row math
     margin_rows = int(round((margin_ms / 1000.0) * fs / 8.0))
