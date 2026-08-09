@@ -1,0 +1,10 @@
+PySide6
+pyqtgraph
+numpy
+scipy
+pyserial
+joblib
+scikit-learn
+pandas
+matplotlib
+

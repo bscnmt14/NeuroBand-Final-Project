@@ -1,0 +1,10 @@
+{
+  "baudrate": 921600,
+  "sampling_rate_hz": 1100.0,
+  "window_ms": 500,
+  "prediction_interval_ms": 120,
+  "confidence_threshold": 0.55,
+  "selected_sensors": ["B0DAC7E9", "ED7A78C8", "37ED348F"],
+  "emg_plot_samples": 1200
+}
+

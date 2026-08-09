@@ -1,0 +1,43 @@
+flowchart LR
+    subgraph RT["Realtime data path"]
+        SENSORS["3 x uMyo sensors<br/>Hardware/data source"]
+        OEM["OEM packet parser<br/>OEM_files/umyo_parser.py"]
+        STREAM["Acquisition<br/>NeuroBand_files/umyo_stream.py"]
+        SYNC["Window synchronization<br/>realtime_gesture_gui.py: classifier_window()"]
+        PRE["Realtime preprocessing<br/>classifier_adapter.py: FeatureExtractor"]
+        ADAPTER["Inference + decision<br/>classifier_adapter.py + GUI DecisionSmoother"]
+        GUI["Realtime GUI<br/>realtime_gesture_gui.py"]
+        MOUSE["Windows mouse<br/>mouse_game_control.py"]
+        GAME["Target game<br/>neuroband_shooter.py"]
+        SENSORS --> OEM --> STREAM --> SYNC --> PRE --> ADAPTER --> GUI
+        GUI --> MOUSE
+        GUI --> GAME
+    end
+
+    subgraph TRAIN["Personal training path"]
+        RECORDING["Calibration recording<br/>Data written by realtime_gesture_gui.py"]
+        QUALITY["Quality audit<br/>recording_quality_gate.py"]
+        PIPELINE["Training data pipeline<br/>training_data_pipeline.py"]
+        PRIMITIVES["Model primitives<br/>model_training.py"]
+        PERSONAL["Personal training<br/>personal_stage_training.py"]
+        MODEL["Personal model artifact<br/>Generated .pkl file"]
+        RECORDING --> QUALITY --> PIPELINE --> PRIMITIVES --> PERSONAL --> MODEL
+    end
+
+    subgraph EVAL["Evaluation and adaptation path"]
+        REPLAY["Chronological replay<br/>replay_evaluation.py: run_replay()"]
+        DECISIONS["Decision comparison<br/>replay_evaluation.py: compare_decision_strategies()"]
+        REPORTS["Evaluation reports<br/>Generated output files"]
+        CURRENT["Short current session<br/>Data recorded by GUI"]
+        UPDATE["Short recalibration<br/>update_personal_model.py"]
+        REPLAY --> DECISIONS --> REPORTS
+        CURRENT --> UPDATE
+    end
+
+    STREAM -->|record synchronized samples| RECORDING
+    GUI -.->|guided protocol labels| RECORDING
+    MODEL -->|load selected model| ADAPTER
+    RECORDING -->|replay data| REPLAY
+    MODEL -.->|selected model for replay| REPLAY
+    MODEL -->|base model| UPDATE
+    UPDATE -.->|validated updated artifact| MODEL
